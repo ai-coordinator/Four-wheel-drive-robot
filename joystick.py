@@ -2,10 +2,11 @@ import time
 import serial
 import pygame
 
-SERIAL_PORT = "COM8"
+# SERIAL_PORT = "COM8"
+SERIAL_PORT = "/dev/ttyACM0"
 BAUD = 115200
 
-DEADZONE = 0.12
+DEADZONE = 0.18
 MAX_OUT = 127
 SEND_HZ = 50
 
@@ -67,6 +68,9 @@ def main():
             if now - last_send >= dt:
                 ser.write(f"{L},{R}\n".encode("ascii"))
                 last_send = now
+
+            if js.get_button(0):  # Aボタン
+                L, R = 0, 0
 
             time.sleep(0.001)
 
