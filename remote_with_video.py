@@ -18,6 +18,8 @@ import struct
 import select
 import subprocess
 import re
+import shutil
+import glob
 
 import numpy as np
 import cv2
@@ -45,7 +47,7 @@ BTN_STOP = 0
 NEUTRAL = 0.06
 
 # ========= Arbitration / Safety =========
-REMOTE_TIMEOUT = 1.0
+REMOTE_TIMEOUT = 0.30
 GAMEPAD_TIMEOUT = 0.25
 FAILSAFE_STOP = 1.2
 
@@ -70,6 +72,9 @@ state = {
     "last_sent_L": 0, "last_sent_R": 0,
     "last_write_ts": 0.0,
     "remote_last_cmd_ts": 0.0,
+    "remote_seq": 0,
+    "remote_client_t": 0.0,
+    "remote_sid": "",
 }
 
 frame_lock = threading.Lock()
@@ -504,7 +509,98 @@ def usb_video_loop():
 # ==========================
 # Jetson Telemetry
 # ==========================
+
+def _read_first_line(path: str):
+    try:
+        with open(path, "r") as f:
+            return f.readline().strip()
+    except Exception:
+        return None
+
+_cpu_prev = {"total": None, "idle": None, "ts": None}
+
+def _cpu_percent_sample():
+    """Return overall CPU utilization percent using /proc/stat deltas."""
+    try:
+        line = _read_first_line("/proc/stat")
+        if not line or not line.startswith("cpu "):
+            return None
+        parts = [int(x) for x in line.split()[1:]]
+        # user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice
+        total = sum(parts)
+        idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+        now = time.time()
+        if _cpu_prev["total"] is None:
+            _cpu_prev.update({"total": total, "idle": idle, "ts": now})
+            return None
+        dt_total = total - _cpu_prev["total"]
+        dt_idle = idle - _cpu_prev["idle"]
+        _cpu_prev.update({"total": total, "idle": idle, "ts": now})
+        if dt_total <= 0:
+            return None
+        util = 100.0 * (dt_total - dt_idle) / dt_total
+        return round(max(0.0, min(100.0, util)), 1)
+    except Exception:
+        return None
+
+def _cpu_freq_avg_mhz():
+    """Average current CPU freq across cores (MHz) using sysfs."""
+    freqs = []
+    for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq"):
+        v = _read_first_line(p)
+        if not v:
+            continue
+        try:
+            khz = int(v)
+            freqs.append(khz / 1000.0)
+        except Exception:
+            pass
+    if freqs:
+        return int(round(sum(freqs) / len(freqs)))
+    return None
+
+def _gpu_util_pct_sysfs():
+    """Jetson GPU load percent from /sys/devices/gpu.0/load (0-255)."""
+    v = _read_first_line("/sys/devices/gpu.0/load")
+    if not v:
+        return None
+    try:
+        load = int(v)
+        return int(round(max(0, min(255, load)) * 100.0 / 255.0))
+    except Exception:
+        return None
+
+def _temps_from_thermal_zones():
+    temps = {}
+    try:
+        for tz in glob.glob("/sys/class/thermal/thermal_zone*"):
+            t = _read_first_line(os.path.join(tz, "type")) or "tz"
+            v = _read_first_line(os.path.join(tz, "temp"))
+            if not v:
+                continue
+            try:
+                mv = float(v)
+                # many zones are in milliC
+                c = mv / 1000.0 if mv > 200 else mv
+                # filter obviously bogus
+                if -20 <= c <= 140:
+                    temps[t] = round(c, 1)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not temps:
+        return None
+
+    hot_name = max(temps, key=lambda k: temps[k])
+    hot_val = temps[hot_name]
+    return {"temps_c": temps, "temp_hot_name": hot_name, "temp_hot_c": hot_val, "temp_max_c": hot_val}
+
 def read_proc_fallback():
+    """Best-effort telemetry without tegrastats.
+    Provides CPU/RAM/Disk/Uptime/Load + (if available) CPU freq, GPU load, temps.
+    """
     d = {}
 
     # uptime
@@ -524,6 +620,24 @@ def read_proc_fallback():
     except Exception:
         pass
 
+    # cpu util / freq
+    cpu_pct = _cpu_percent_sample()
+    if cpu_pct is not None:
+        d["cpu_util_pct"] = cpu_pct
+    cpu_f = _cpu_freq_avg_mhz()
+    if cpu_f is not None:
+        d["cpu_freq_avg_mhz"] = cpu_f
+
+    # gpu util
+    gpu_pct = _gpu_util_pct_sysfs()
+    if gpu_pct is not None:
+        d["gpu_util_pct"] = gpu_pct
+
+    # temps
+    tinfo = _temps_from_thermal_zones()
+    if tinfo:
+        d.update(tinfo)
+
     # meminfo
     try:
         mem = {}
@@ -539,6 +653,25 @@ def read_proc_fallback():
             d["ram_total_mb"] = int(total)
             d["ram_used_mb"] = int(used)
             d["ram_util_pct"] = round(100.0 * used / max(1, total), 1)
+    except Exception:
+        pass
+
+    # swap
+    try:
+        mem = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("SwapTotal") or line.startswith("SwapFree"):
+                    k = line.split(":")[0]
+                    v = line.split(":")[1].strip().split()[0]
+                    mem[k] = int(v)
+        if "SwapTotal" in mem and "SwapFree" in mem:
+            total = mem["SwapTotal"] // 1024
+            free = mem["SwapFree"] // 1024
+            used = max(0, total - free)
+            d["swap_total_mb"] = int(total)
+            d["swap_used_mb"] = int(used)
+            d["swap_util_pct"] = round(100.0 * used / max(1, total), 1)
     except Exception:
         pass
 
@@ -654,67 +787,92 @@ def parse_tegrastats_line(line: str):
     d["raw"] = s
     return d
 
-def telemetry_loop():
-    # Prefer tegrastats
-    cmd = ["tegrastats", "--interval", "1000"]
 
+def _find_tegrastats():
+    # systemd sometimes has a minimal PATH; try explicit locations too
+    p = shutil.which("tegrastats")
+    if p and os.path.exists(p):
+        return p
+    for cand in ["/usr/bin/tegrastats", "/usr/sbin/tegrastats", "/bin/tegrastats", "/sbin/tegrastats"]:
+        if os.path.exists(cand):
+            return cand
+    return None
+
+def telemetry_loop():
+    """Continuously refresh global telemetry dict.
+
+    Priority:
+      1) tegrastats (most complete: CPU/GPU/EMC/temps)
+      2) sysfs/proc fallback (CPU/GPU/temps/mem/disk/load/uptime)
+    """
     last_net = _read_net_bytes()
     last_net_t = time.time()
 
-    try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-        with tele_lock:
-            telemetry.update({"ok": True, "src": "tegrastats", "detail": "running"})
-
-        while True:
-            line = p.stdout.readline() if p.stdout else ""
-            if not line:
-                time.sleep(0.2)
-                continue
-
-            d = parse_tegrastats_line(line)
-            d.update(read_proc_fallback())
-
-            # net Mbps
-            now = time.time()
-            cur = _read_net_bytes()
-            if cur and last_net:
-                dt = max(1e-6, now - last_net_t)
-                rx_bps = (cur[0] - last_net[0]) * 8.0 / dt
-                tx_bps = (cur[1] - last_net[1]) * 8.0 / dt
-                d["net_down_mbps"] = round(rx_bps / 1e6, 2)
-                d["net_up_mbps"] = round(tx_bps / 1e6, 2)
-            last_net = cur or last_net
-            last_net_t = now
-
+    tegra = _find_tegrastats()
+    if tegra:
+        cmd = [tegra, "--interval", "1000"]
+        try:
+            # use line-buffered text mode
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
             with tele_lock:
-                telemetry["ok"] = True
-                telemetry["ts"] = time.time()
-                telemetry["data"] = d
+                telemetry.update({"ok": True, "src": "tegrastats", "detail": f"running: {tegra}"})
 
-    except Exception as e:
-        with tele_lock:
-            telemetry.update({"ok": True, "src": "fallback", "detail": f"tegrastats failed: {e}"})
+            while True:
+                line = p.stdout.readline() if p.stdout else ""
+                if not line:
+                    # if process died, break and fall back
+                    if p.poll() is not None:
+                        raise RuntimeError("tegrastats exited")
+                    time.sleep(0.2)
+                    continue
 
-        while True:
-            d = read_proc_fallback()
-            # net
-            now = time.time()
-            cur = _read_net_bytes()
-            if cur and last_net:
-                dt = max(1e-6, now - last_net_t)
-                rx_bps = (cur[0] - last_net[0]) * 8.0 / dt
-                tx_bps = (cur[1] - last_net[1]) * 8.0 / dt
-                d["net_down_mbps"] = round(rx_bps / 1e6, 2)
-                d["net_up_mbps"] = round(tx_bps / 1e6, 2)
-            last_net = cur or last_net
-            last_net_t = now
+                d = parse_tegrastats_line(line)
+                # fill missing fields with proc/sysfs where possible
+                d.update(read_proc_fallback())
 
+                # net Mbps
+                now = time.time()
+                cur = _read_net_bytes()
+                if cur and last_net:
+                    dt = max(1e-6, now - last_net_t)
+                    rx_bps = (cur[0] - last_net[0]) * 8.0 / dt
+                    tx_bps = (cur[1] - last_net[1]) * 8.0 / dt
+                    d["net_down_mbps"] = round(rx_bps / 1e6, 2)
+                    d["net_up_mbps"] = round(tx_bps / 1e6, 2)
+                last_net = cur or last_net
+                last_net_t = now
+
+                with tele_lock:
+                    telemetry["ok"] = True
+                    telemetry["ts"] = time.time()
+                    telemetry["data"] = d
+
+        except Exception as e:
             with tele_lock:
-                telemetry["ok"] = True
-                telemetry["ts"] = time.time()
-                telemetry["data"] = d
-            time.sleep(1.0)
+                telemetry.update({"ok": True, "src": "sysfs", "detail": f"tegrastats failed: {e}"})
+    else:
+        with tele_lock:
+            telemetry.update({"ok": True, "src": "sysfs", "detail": "tegrastats not found"})
+
+    # fallback loop
+    while True:
+        d = read_proc_fallback()
+        now = time.time()
+        cur = _read_net_bytes()
+        if cur and last_net:
+            dt = max(1e-6, now - last_net_t)
+            rx_bps = (cur[0] - last_net[0]) * 8.0 / dt
+            tx_bps = (cur[1] - last_net[1]) * 8.0 / dt
+            d["net_down_mbps"] = round(rx_bps / 1e6, 2)
+            d["net_up_mbps"] = round(tx_bps / 1e6, 2)
+        last_net = cur or last_net
+        last_net_t = now
+
+        with tele_lock:
+            telemetry["ok"] = True
+            telemetry["ts"] = time.time()
+            telemetry["data"] = d
+        time.sleep(1.0)
 
 
 # ==========================
@@ -869,112 +1027,54 @@ main{ max-width:1400px; margin:0 auto; padding:16px; }
 .cardControl{ grid-area: control; }
 .cardCamera{ grid-area: camera; }
 .cardTele{ grid-area: tele; }
-
 .cardStatus{ grid-area: status; }
-@media (max-width: 1180px){
-  /* phone/tablet: CAMERA -> CONTROL -> TELEMETRY */
+
+/* ============================
+   Responsive (SIMPLIFIED)
+   - Desktop: 3 columns (control / camera / tele) + status full width
+   - Tablet/Mid: camera full width, then (control | tele), then status
+   - Phone: 1 column stack
+   ============================ */
+
+/* Tablet / mid screens (this fixes "1050x911 -> only status" type breakage) */
+@media (max-width: 1199px){
+  .grid{
+    grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr);
+    grid-template-areas:
+      "camera  camera"
+      "control tele"
+      "status  status";
+    align-items: start;
+  }
+
+  /* Keep joystick usable and square */
+  #pad{
+    width:100%;
+    aspect-ratio: 1 / 1 !important;
+    height: auto !important;
+    max-width: min(92vw, 420px);
+    margin-inline: auto;
+  }
+}
+
+/* Phone */
+@media (max-width: 719px){
+  main{ padding:12px; }
   .grid{
     grid-template-columns: 1fr;
     grid-template-areas:
       "camera"
       "control"
-      "tele";
+      "tele"
+      "status";
+    gap:12px;
   }
-  .cardCamera{ grid-area: camera; }
-  .cardControl{ grid-area: control; }
-  .cardTele{ grid-area: tele; }
+
+  /* Avoid camera stage being too tall on small screens */
+  .camStage{ min-height: unset; max-height: 44vh; }
+  .teleGrid{ grid-template-columns: 1fr; }
+  .radar{ width:190px; height:190px; flex:0 0 190px; }
 }
-
-
-@media (max-width: 1024px) and (orientation: landscape){
-  /* landscape (phone/tablet): LEFT thumb CONTROL + RIGHT CAMERA; scroll down for TELEMETRY/STATUS */
-  .grid{
-    grid-template-columns: minmax(280px, 38vw) minmax(0, 1fr);
-    grid-template-areas:
-      "control camera"
-      "tele tele";
-    align-items: start;
-  }
-  .cardControl{ grid-area: control; }
-  .cardCamera{ grid-area: camera; }
-  .cardTele{ grid-area: tele; }
-
-  /* keep the top usable without hiding control */
-  #pad{
-    width:100%;
-    aspect-ratio: 1 / 1 !important;
-    height: auto !important;
-    max-width: min(92vw, 420px);
-    margin-inline: auto;
-  }
-
-  /* explicit height so RGB fills and Depth PiP overlays */
-  .camStage{ position:relative; width:100%; height:auto; min-height: 420px; overflow:hidden; aspect-ratio: __RGB_W__/__RGB_H__; max-height: 70vh; }
-  #rgbImg.streamMain{
-    display:block;
-    width:100%;
-    height:100%;
-    object-fit: contain;
-  }
-  #depthPip.pip{
-    position:absolute;
-    left:12px;
-    bottom:12px;
-    z-index:30;
-  }
-
-  .card .bd{ padding:10px; }
-  .controls .btn{ padding:10px 10px; }
-  .kbd .key{ padding:6px 8px; }
-}
-
-/* === Tablet/Phone landscape (coarse pointer): LEFT CONTROL + RIGHT CAMERA; scroll down for TELEMETRY/STATUS === */
-@media (hover: none) and (pointer: coarse) and (orientation: landscape){
-  .grid{
-    grid-template-columns: minmax(280px, 40vw) minmax(0, 1fr);
-    grid-template-areas:
-      "control camera"
-      "tele tele";
-    align-items: start;
-  }
-  .cardControl{ grid-area: control; }
-  .cardCamera{ grid-area: camera; }
-  .cardTele{ grid-area: tele; }
-
-  /* Keep above-the-fold usable */
-  #pad{
-    width:100%;
-    aspect-ratio: 1 / 1 !important;
-    height: auto !important;
-    max-width: min(92vw, 420px);
-    margin-inline: auto;
-  }
-
-  /* IMPORTANT:
-     Percent heights on <img> won't work if parent height is 'auto'.
-     So give camStage an explicit height so RGB fills and Depth PiP overlays. */
-  .camStage{ position:relative; width:100%; height:auto; min-height: 420px; overflow:hidden; aspect-ratio: __RGB_W__/__RGB_H__; max-height: 70vh; }
-  #rgbImg.streamMain{
-    display:block;
-    width:100%;
-    height:100%;
-    object-fit: contain;
-  }
-  #depthPip.pip{
-    position:absolute;
-    left:12px;
-    bottom:12px;
-    z-index:30;
-  }
-
-  .pip{ width: 40%; min-width:120px; max-width:220px; }
-  .card .bd{ padding:10px; }
-  .controls .btn{ padding:10px 10px; }
-  .kbd .key{ padding:6px 8px; }
-}
-
-
-
 
 .card{
   background: var(--panel);
@@ -1180,7 +1280,7 @@ main{ max-width:1400px; margin:0 auto; padding:16px; }
   border-radius:50%;
   background:
     radial-gradient(circle at 50% 50%, rgba(255,255,255,.07) 0 45%, transparent 46%),
-    conic-gradient(from -90deg, rgba(122,162,255,.95) 0deg, rgba(43,228,167,.95) 180deg, rgba(255,255,255,.10) 180deg 360deg);
+    conic-gradient(from -90deg, rgba(122,162,255,.95) 0deg, rgba(43,228,167,.95) var(--ang, 0deg), rgba(255,255,255,.10) var(--ang, 0deg) 360deg);
   position:relative;
   flex:0 0 60px;
   overflow:hidden;
@@ -1208,42 +1308,105 @@ main{ max-width:1400px; margin:0 auto; padding:16px; }
 
 .pills{
   margin-top:12px;
-  display:flex;
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  grid-auto-rows: minmax(44px, auto);
   gap:10px;
-  flex-wrap:wrap;
+  align-items:stretch;
 }
+.pills .pill--span2{ grid-column: 1 / -1; }
+@media (max-width: 560px){
+  .pills{ grid-template-columns: 1fr; }
+  .pills .pill--span2{ grid-column: auto; }
+}
+
 .pill{
-  display:inline-flex;
+  display:flex;
   align-items:center;
-  gap:8px;
-  padding:9px 12px;
+  justify-content:space-between;
+  gap:10px;
+  padding:10px 14px;
   border-radius:999px;
   background: rgba(255,255,255,.06);
   border:1px solid rgba(255,255,255,.10);
   color: rgba(255,255,255,.88);
   font-weight:900;
+  min-width:0;
 }
-.pill .k{ color: var(--muted); font-weight:900; }
+.pill .k{ color: var(--muted); font-weight:900; white-space:nowrap; }
+.pill .v{
+  display:flex;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+  column-gap:10px;
+  row-gap:2px;
+  text-align:right;
+  min-width:0;
+  overflow-wrap:anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.pill.hot .v{ overflow-wrap:anywhere; }
 .pill.good{ border-color: rgba(43,228,167,.18); }
 .pill.warn{ border-color: rgba(255,209,102,.18); }
 .pill.bad{ border-color: rgba(255,77,109,.22); }
 
 .tempChips{
   margin-top:10px;
-  display:flex;
-  flex-wrap:wrap;
-  gap:8px;
+  display:grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap:10px;
 }
-.chip{
-  padding:8px 10px;
-  border-radius:999px;
+@media (max-width: 560px){
+  .tempChips{ grid-template-columns: 1fr; }
+}
+.tempRow{
+  padding:10px 12px;
+  border-radius:14px;
   background: rgba(0,0,0,.12);
   border:1px solid rgba(255,255,255,.10);
-  color: rgba(255,255,255,.85);
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.tempTop{
+  display:flex;
+  align-items:baseline;
+  justify-content:space-between;
+  gap:10px;
+}
+.tempName{
+  flex:1;
   font-weight:900;
   font-size:12px;
+  color: rgba(255,255,255,.86);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
 }
-
+.tempVal{
+  font-weight:900;
+  font-size:12px;
+  color: rgba(255,255,255,.92);
+  text-align:right;
+  white-space:nowrap;
+}
+.tempBar{
+  position:relative;
+  height:10px;
+  border-radius:999px;
+  background: rgba(255,255,255,.10);
+  overflow:hidden;
+}
+.tempFill{
+  position:absolute;
+  left:0; top:0; bottom:0;
+  width:0%;
+  border-radius:999px;
+  background: rgba(122,162,255,.85);
+}
+.tempRow.good .tempFill{ background: rgba(43,228,167,.90); }
+.tempRow.warn .tempFill{ background: rgba(255,209,102,.90); }
+.tempRow.bad  .tempFill{ background: rgba(255,77,109,.92); }
 /* ===== STATUS ===== */
 .statGrid{
   display:grid;
@@ -1385,39 +1548,6 @@ main{ max-width:1400px; margin:0 auto; padding:16px; }
 }
 
 
-/* ===== Responsive layout (phone portrait / iPad portrait) ===== */
-@media (max-width: 720px){
-  main{ padding:12px; }
-  /* Phone portrait: video on top, then (joystick | telemetry), then status */
-  .grid{
-    grid-template-columns: 1fr 1fr;
-    grid-template-areas:
-      "camera camera"
-      "control tele"
-      "status status";
-    gap:12px;
-  }
-  .camStage{ min-height: unset; max-height: 42vh; }
-  /* keep joystick visible: cap pad height in portrait */
-  #pad{
-    width:100%;
-    aspect-ratio: 1 / 1 !important;
-    height: auto !important;
-    max-width: min(92vw, 420px);
-    margin-inline: auto;
-  }
-  .padWrap{ gap:10px; }
-  .teleGrid{ grid-template-columns: 1fr; }
-  .radar{ width:190px; height:190px; flex:0 0 190px; }
-}
-@media (min-width: 721px) and (max-width: 1100px) and (orientation: portrait) and (pointer: coarse){
-  .grid{ grid-template-columns: 1fr 1fr; grid-template-areas:
-    "camera camera"
-    "control tele"
-    "status status";
-  }
-  .camStage{ min-height: unset; max-height: 52vh; }
-}
 /* keep Depth PiP overlay in every mode */
 #depthPip{ position:absolute !important; left:12px !important; bottom:12px !important; z-index:50 !important;
   width: clamp(140px, 30%, 260px) !important; max-width: 42% !important; min-width: 140px !important;
@@ -1539,11 +1669,13 @@ main{ max-width:1400px; margin:0 auto; padding:16px; }
         </div>
 
         <div class="pills">
-          <div class="pill good"><span class="k">Uptime:</span> <span id="uptime">-</span></div>
-          <div class="pill"><span class="k">Load:</span> <span id="loadavg">-</span></div>
-          <div class="pill warn"><span class="k">Hot:</span> <span id="hotSpot">-</span></div>
-          <div class="pill"><span class="k">NET:</span> ↓ <span id="netDown">-</span> ↑ <span id="netUp">-</span> Mbps</div>
-          <div class="pill"><span class="k">Src:</span> <span id="teleSrc">-</span></div>
+          <div class="pill good"><span class="k">Uptime:</span><span class="v"><span id="uptime">-</span></span></div>
+          <div class="pill"><span class="k">Load:</span><span class="v"><span id="loadavg">-</span></span></div>
+
+          <div class="pill warn pill--span2 hot"><span class="k">Hot:</span><span class="v"><span id="hotSpot">-</span></span></div>
+
+          <div class="pill"><span class="k">NET:</span><span class="v"><span>↓ <span id="netDown">-</span></span><span>↑ <span id="netUp">-</span> Mbps</span></span></div>
+          <div class="pill"><span class="k">Src:</span><span class="v"><span id="teleSrc">-</span></span></div>
         </div>
 
         <div class="tempChips" id="tempChips"></div>
@@ -1620,6 +1752,9 @@ const pad=document.getElementById("pad");
 const dot=document.getElementById("dot");
 const elog=document.getElementById("elog");
 let x=0,y=0,keys={w:false,a:false,s:false,d:false},dragging=false;
+let _lastPollErr=0;
+let _lastJsErr=0;
+window.addEventListener('error', (ev)=>{const now=Date.now(); if(now-_lastJsErr>2000){_lastJsErr=now; try{log('JS error: '+(ev.message||ev.type));}catch(e){}}});
 
 const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
 function updateDot(){
@@ -1643,15 +1778,78 @@ function log(line){
   elog.textContent = `[${t}] ${line}\n` + elog.textContent;
 }
 
-function send(){
+const SID = (Date.now().toString(36) + "_" + Math.random().toString(36).slice(2,10));
+let cmdSeq = 0;
+
+// --- Anti-queue + smooth control ---
+// We never abort in-flight requests (that causes jerk). Instead we COALESCE:
+// at most one request in flight, and we only keep the latest command pending.
+let inFlight = false;
+let pendingPayload = null;
+let pendingForce = false;
+
+// simple low-pass filter to reduce jitter from touch/trackpad
+let fx = 0, fy = 0;
+const SMOOTH = 0.35;      // 0..1 (higher = more responsive)
+const SEND_MS = 25;       // ~40Hz when changing
+const KEEPALIVE_MS = 50;  // ~20Hz when holding same
+let lastSentAt = 0;
+let lastSentX = 0, lastSentY = 0;
+
+function pumpSend(){
+  if(inFlight || !pendingPayload) return;
+  inFlight = true;
+
+  const payload = pendingPayload;
+  const force = pendingForce;
+  pendingPayload = null;
+  pendingForce = false;
+
+  lastSentAt = performance.now();
+  lastSentX = payload.turn;
+  lastSentY = payload.throttle;
+
+  cmdSeq++;
+
   fetch("/api/cmd", {
     method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({turn:x, throttle:y})
-  }).catch(()=>{});
+    body:JSON.stringify({turn:payload.turn, throttle:payload.throttle, sid:SID, seq:cmdSeq, t:Date.now()})
+  }).catch(()=>{}).finally(()=>{
+    inFlight = false;
+    // if something arrived while sending, send it immediately (still coalesced)
+    if(pendingPayload) pumpSend();
+  });
 }
 
-function stop(){ x=0;y=0; updateDot(); send(); log("STOP"); }
+function send(force=false){
+  // filter input a bit (prevents tiny oscillations from feeling like jerk)
+  fx = fx + (x - fx) * SMOOTH;
+  fy = fy + (y - fy) * SMOOTH;
+
+  const now = performance.now();
+  const same = (Math.abs(fx-lastSentX) < 0.005 && Math.abs(fy-lastSentY) < 0.005);
+
+  if(!force){
+    const minDt = same ? KEEPALIVE_MS : SEND_MS;
+    if(now - lastSentAt < minDt){
+      // just remember latest; pump will send when allowed / when inFlight clears
+      pendingPayload = {turn: fx, throttle: fy};
+      return;
+    }
+  }
+
+  pendingPayload = {turn: fx, throttle: fy};
+  pendingForce = pendingForce || force;
+  pumpSend();
+}
+
+// Keepalive loop: ensures "hold" keeps moving smoothly without creating a queue.
+setInterval(()=>{
+  if(dragging || Math.abs(x) > 0.01 || Math.abs(y) > 0.01) send(false);
+}, 33);
+
+function stop(){ x=0;y=0; updateDot(); send(true); log("STOP"); }
 function center(){ x=0;y=0; updateDot(); }
 
 function pointerToXY(ev){
@@ -1676,6 +1874,7 @@ pad.addEventListener("pointermove",ev=>{if(!dragging)return;pointerToXY(ev);send
 pad.addEventListener("pointerup",()=>{dragging=false; stop();});
 pad.addEventListener("pointercancel",()=>{dragging=false; stop();});
 
+window.addEventListener("blur", ()=>{ try{ stop(); }catch(e){} });
 window.addEventListener("keydown",e=>{
   if(e.repeat) return;
   if(e.key==="w") keys.w=true;
@@ -1812,9 +2011,13 @@ setInterval(tickSnapshot, 33);
 /* ===== Gauges ===== */
 function setGauge(elId, pct){
   const el = document.getElementById(elId);
-  pct = Math.max(0, Math.min(100, pct||0));
+  if(!el) return;
+  pct = Math.max(0, Math.min(100, (pct===0?0:(pct||0))));
   el.textContent = Math.round(pct);
-  // 色はCSS conicで表現してるので、数値だけ更新（軽量）
+  // conic-gradient の終端角をCSS変数で更新（0-100% -> 0-360deg）
+  const ang = (pct * 3.6).toFixed(1) + "deg";
+  const ring = el.parentElement; // .gauge
+  if(ring) ring.style.setProperty("--ang", ang);
 }
 
 /* ===== Radar ===== */
@@ -1843,21 +2046,67 @@ function setRadarFromLR(L, R){
   dot.style.top  = py + "px";
 }
 
-/* ===== Status poll ===== */
 function renderTemps(temps){
   const box = document.getElementById("tempChips");
   box.innerHTML = "";
   if(!temps) return;
-  // temps is object {name: value}
+
+  // temps: object {name: valueC}
   const keys = Object.keys(temps);
-  // sort by temp desc
-  keys.sort((a,b)=> (temps[b]-temps[a]));
-  keys.slice(0, 10).forEach(k=>{
-    const v = temps[k];
-    const d = document.createElement("div");
-    d.className = "chip";
-    d.textContent = `${k}: ${v}°C`;
-    box.appendChild(d);
+
+  // sort by temp desc (unknown/NaN last)
+  keys.sort((a,b)=>{
+    const av = Number(temps[a]); const bv = Number(temps[b]);
+    if(!isFinite(av) && !isFinite(bv)) return 0;
+    if(!isFinite(av)) return 1;
+    if(!isFinite(bv)) return -1;
+    return bv - av;
+  });
+
+  // temperature-to-bar mapping range (visual only)
+  const T_MIN = 20;
+  const T_MAX = 90;
+
+  keys.slice(0, 12).forEach(k=>{
+    const v = Number(temps[k]);
+    if(!isFinite(v)) return;
+
+    const row = document.createElement("div");
+    row.className = "tempRow";
+
+    // color bucket
+    if(v >= 70) row.classList.add("bad");
+    else if(v >= 55) row.classList.add("warn");
+    else row.classList.add("good");
+
+    const top = document.createElement("div");
+    top.className = "tempTop";
+
+    const name = document.createElement("div");
+    name.className = "tempName";
+    name.title = k;
+    name.textContent = k;
+
+    const val = document.createElement("div");
+    val.className = "tempVal";
+    val.textContent = v.toFixed(1) + "°C";
+
+    top.appendChild(name);
+    top.appendChild(val);
+
+    const bar = document.createElement("div");
+    bar.className = "tempBar";
+
+    const fill = document.createElement("div");
+    fill.className = "tempFill";
+    const pct = Math.max(0, Math.min(1, (v - T_MIN) / (T_MAX - T_MIN))) * 100;
+    fill.style.width = pct.toFixed(1) + "%";
+    bar.appendChild(fill);
+
+    row.appendChild(top);
+    row.appendChild(bar);
+
+    box.appendChild(row);
   });
 }
 
@@ -1936,12 +2185,26 @@ async function poll(){
 
     renderTemps(d.temps_c);
 
-  }catch(e){}
+  }catch(e){const now=Date.now(); if(now-_lastPollErr>2000){_lastPollErr=now; try{log('poll error: '+e);}catch(_){}}}
 }
 
 setInterval(poll, 300);
 updateDot();
 log("Console ready");
+function sendStopBeacon(){
+  try{
+    const payload = JSON.stringify({turn:0, throttle:0, sid:SID, seq:cmdSeq+1, t:Date.now()});
+    if(navigator.sendBeacon){
+      navigator.sendBeacon("/api/cmd", new Blob([payload], {type:"application/json"}));
+    }else{
+      fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:payload,keepalive:true}).catch(()=>{});
+    }
+  }catch(e){}
+}
+
+window.addEventListener("pagehide", ()=>{ sendStopBeacon(); });
+document.addEventListener("visibilitychange", ()=>{ if(document.hidden) sendStopBeacon(); });
+
 </script>
 </body>
 </html>
@@ -2001,8 +2264,33 @@ def api_status():
 @app.post("/api/cmd")
 def api_cmd():
     data = request.get_json(force=True, silent=True) or {}
+
+    # --- Anti-queue / reload-safe fields (browser -> server) ---
+    # sid: page session id (changes on reload). Used to reset seq.
+    # seq: increasing integer within the page session (optional)
+    # t:   client ms epoch (Date.now()) for "late" detection
+    sid = data.get("sid", "")
+    try:
+        sid = str(sid)[:64]
+    except Exception:
+        sid = ""
+
+    seq = data.get("seq", 0)
+    try:
+        seq = int(seq)
+    except Exception:
+        seq = 0
+
+    ct_ms = data.get("t", 0)
+    try:
+        ct_ms = float(ct_ms)
+    except Exception:
+        ct_ms = 0.0
+    ct = ct_ms / 1000.0 if ct_ms else 0.0
+
     turn = float(data.get("turn", 0.0))
     throttle = float(data.get("throttle", 0.0))
+
 
     turn = max(-1.0, min(1.0, turn))
     throttle = max(-1.0, min(1.0, throttle))
@@ -2012,13 +2300,45 @@ def api_cmd():
 
     L, R = mix_to_lr(throttle, turn)
 
+    now = time.time()
     with lock:
+        # Reset sequence when browser reloads (sid changes)
+        if sid and sid != state.get("remote_sid", ""):
+            state["remote_sid"] = sid
+            state["remote_seq"] = 0
+            state["remote_client_t"] = 0.0
+
+        # Drop commands that arrive "too late" (request queue / network stall).
+        # This prevents "moving after you stop" due to a backlog.
+        # NOTE: If stop packet is also delayed, REMOTE_TIMEOUT will stop the robot quickly.
+        if ct:
+            late_s = now - ct
+            if late_s > 0.35:
+                return jsonify({"ok": True, "ignored": True, "reason": "late", "late_s": round(late_s, 3)})
+
+        # Drop stale seq within the same sid (optional safeguard)
+        if seq and seq <= state.get("remote_seq", 0):
+            return jsonify({"ok": True, "ignored": True, "reason": "stale_seq", "seq": seq, "last": state.get("remote_seq", 0)})
+
+        # Drop stale client timestamps (out-of-order)
+        if ct and ct < state.get("remote_client_t", 0.0):
+            return jsonify({"ok": True, "ignored": True, "reason": "stale_time", "t": ct_ms})
+
+        if sid:
+            state["remote_sid"] = sid
+        if seq:
+            state["remote_seq"] = seq
+        if ct:
+            state["remote_client_t"] = ct
+
         state["remote_L"] = L
         state["remote_R"] = R
-        state["remote_ts"] = time.time()
-        state["remote_last_cmd_ts"] = time.time()
+        state["remote_ts"] = now
+        state["remote_last_cmd_ts"] = now
 
-    return jsonify({"ok": True, "L": L, "R": R})@app.post("/api/system/reboot")
+    return jsonify({"ok": True, "L": L, "R": R})
+
+@app.post("/api/system/reboot")
 def api_system_reboot():
     if not _auth_ok(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401

@@ -1,0 +1,302 @@
+<!doctype html>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Robot Console</title>
+<link rel="stylesheet" href="/static/css/style.css">
+<style>
+:root{
+  --rgb_w: {{ rgb_w }};
+  --rgb_h: {{ rgb_h }};
+}
+</style>
+</head>
+
+<body>
+<header>
+  <div class="topbar">
+    <div class="brand">
+      <div style="width:10px;height:10px;border-radius:3px;background:var(--accent); box-shadow:0 0 0 4px rgba(122,162,255,.18)"></div>
+      <div>Robot Console</div>
+      <span class="badge"><span id="connDot" class="dot"></span><span id="connText">connecting...</span></span>
+      <span class="badge">Video: <span id="videoText">...</span></span>
+      <span class="badge">Jetson: <span id="jetsonText">...</span></span>
+      <span class="badge sysBtns">
+        <button class="sysBtn" onclick="doReboot()">REBOOT</button>
+        <button class="sysBtn danger" onclick="doShutdown()">SHUTDOWN</button>
+      <button id="btnKiosk" class="btnKiosk" type="button" title="Animal Kiosk (Fullscreen)">
+        🐾 Kiosk
+      </button>
+
+      </span>
+    </div>
+
+  </div>
+</header>
+
+<main>
+  <div class="grid">
+
+    <!-- LEFT: CONTROL -->
+    <section class="card cardControl">
+      <div class="hd"><b>CONTROL</b><span class="small">touch / keyboard / gamepad</span></div>
+      <div class="bd padWrap">
+        <div id="pad">
+          <div class="padCenter"></div>
+          <div id="dot"></div>
+        </div>
+
+        <div class="controls">
+          <button class="btn btnStop" onclick="stop()">STOP</button>
+          <button class="btn" onclick="center()">CENTER</button>
+        </div>
+
+        <div class="kbd">
+          <span class="key">W forward</span>
+          <span class="key">S back</span>
+          <span class="key">A left</span>
+          <span class="key">D right</span>
+          <span class="key">Space stop</span>
+        </div>
+
+        </div>
+    </section>
+
+    <!-- MID: CAMERA -->
+    <section class="card cardCamera">
+      <div class="hd">
+        <b>CAMERA</b>
+        <div class="camTools">
+          <span class="small">{{ rgb_w }}×{{ rgb_h }} | RGB {{ video_fps }}fps / Depth {{ depth_fps }}fps</span>
+          <label class="toggle">
+            <input id="toggleDepth" type="checkbox" checked>
+            Depth
+          </label>
+          <label class="toggle">
+            <input id="toggleQR" type="checkbox">
+            QR
+          </label>
+        </div>
+      </div>
+
+      <div class="bd">
+        <div class="camStage">
+          <img id="rgbImg" class="streamMain" alt="rgb">
+          <div id="pipRow" class="pipRow">
+            <div id="depthPip" class="pip">
+              <img id="depthImg" alt="depth">
+            </div>
+            <div id="qrPip" class="pip qrPip" style="display:none;">
+              <img id="qrImg" alt="qr">
+            </div>
+          </div>
+        </div>
+        <div class="small" style="margin-top:10px;">Depth range: {{ depth_min }}m - {{ depth_max }}m</div>
+      </div>
+    </section>
+
+    <!-- RIGHT: JETSON -->
+    <section class="card cardTele">
+      <div class="hd"><b>JETSON TELEMETRY</b><span class="small" id="teleTs">-</span></div>
+      <div class="bd">
+        <div class="teleGrid">
+          <div class="tile">
+            <div class="gauge"><div id="gCpu" class="gaugeVal">-</div></div>
+            <div class="meta">
+              <div class="lbl">CPU</div>
+              <div class="big"><span id="cpuUtil">-</span>%</div>
+              <div class="sub">avg freq <span id="cpuFreq">-</span> MHz</div>
+            </div>
+          </div>
+
+          <div class="tile">
+            <div class="gauge"><div id="gGpu" class="gaugeVal">-</div></div>
+            <div class="meta">
+              <div class="lbl">GPU</div>
+              <div class="big"><span id="gpuUtil">-</span>%</div>
+              <div class="sub">EMC <span id="emcUtil">-</span>%</div>
+            </div>
+          </div>
+
+          <div class="tile">
+            <div class="gauge"><div id="gRam" class="gaugeVal">-</div></div>
+            <div class="meta">
+              <div class="lbl">RAM</div>
+              <div class="big"><span id="ramUsed">-</span>/<span id="ramTotal">-</span>MB</div>
+              <div class="sub">SWAP <span id="swapUsed">-</span>/<span id="swapTotal">-</span>MB</div>
+            </div>
+          </div>
+
+          <div class="tile">
+            <div class="gauge"><div id="gDisk" class="gaugeVal">-</div></div>
+            <div class="meta">
+              <div class="lbl">Disk (/)</div>
+              <div class="big"><span id="diskUsed">-</span>/<span id="diskTotal">-</span>GB</div>
+              <div class="sub">free <span id="diskFree">-</span>GB</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="pills">
+          <div class="pill good"><span class="k">Uptime:</span><span class="v"><span id="uptime">-</span></span></div>
+          <div class="pill"><span class="k">Load:</span><span class="v"><span id="loadavg">-</span></span></div>
+
+          <div class="pill warn pill--span2 hot"><span class="k">Hot:</span><span class="v"><span id="hotSpot">-</span></span></div>
+
+          <div class="pill"><span class="k">NET:</span><span class="v"><span>↓ <span id="netDown">-</span></span><span>↑ <span id="netUp">-</span> Mbps</span></span></div>
+          <div class="pill"><span class="k">Src:</span><span class="v"><span id="teleSrc">-</span></span></div>
+        </div>
+
+        <div class="tempChips" id="tempChips"></div>
+      </div>
+    </section>
+
+
+    <!-- STATUS -->
+    <section class="card cardStatus">
+    <div class="hd"><b>STATUS</b><span class="small">active source / last sent</span></div>
+    <div class="bd">
+      <div class="badge badgeWide statusLine">
+        <span class="statChip"><span class="small">Remote</span> <b id="ageRemote">-</b>s</span>
+        <span class="sep">•</span>
+        <span class="statChip"><span class="small">Pad</span> <b id="agePad">-</b>s</span>
+        <span class="sep">•</span>
+        <span class="statChip"><span class="small">RGB FPS</span> <b id="fpsVideo">-</b></span>
+        <span class="sep">•</span>
+        <span class="statChip"><span class="small">Depth FPS</span> <b id="fpsDepth">-</b></span>
+        <span class="sep">•</span>
+        <span class="statChip"><span class="small">RGB age</span> <b id="rgbAge">-</b>ms</span>
+      </div>
+
+      <div class="statGrid">
+        <div class="metric">
+          <div class="lbl">Active</div>
+          <div class="val" id="activeSrc">-</div>
+        </div>
+        <div class="metric">
+          <div class="lbl">Last sent L / R</div>
+          <div class="val"><span id="lastL">-</span> / <span id="lastR">-</span></div>
+        </div>
+      </div>
+
+      <div class="radarWrap">
+        <div class="radar">
+          <div class="radarGlow"></div>
+          <div class="radarLabelN">N</div>
+          <div class="radarLabelE">E</div>
+          <div class="radarLabelS">S</div>
+          <div class="radarLabelW">W</div>
+          <div class="radarCenter"></div>
+          <div id="radarDot" class="radarDot"></div>
+        </div>
+
+        <div style="flex:1; min-width:260px;">
+          <div class="metric" style="margin-bottom:10px;">
+            <div class="lbl">Radar meaning</div>
+            <div class="val" style="font-size:14px; font-weight:900;">
+              X = turn (right +), Y = throttle (forward +)
+              <span class="small" style="display:block; margin-top:6px;">
+                * Left/Right inversion fixed for visual sense
+              </span>
+            </div>
+          </div>
+
+          <div class="metric">
+            <div class="lbl">Last sent (normalized)</div>
+            <div class="val"><span id="stTurn">-</span> / <span id="stThr">-</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <div class="small" style="margin-bottom:6px;">Event log</div>
+        <div id="elog" class="log"></div>
+      </div>
+    </div>
+  
+    </section>
+
+  </div>
+
+  </main>
+
+
+
+  <!-- Kiosk (Animal Face) Overlay -->
+  <div id="kiosk" class="kiosk" style="display:none;" aria-hidden="true">
+    <div class="kioskFace" role="button" tabindex="0" title="Tap to toggle fullscreen">
+      <!-- Simple cute animal face as inline SVG -->
+      <svg class="faceSvg" viewBox="0 0 1024 600" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <defs>
+          <radialGradient id="bgGlow" cx="50%" cy="45%" r="70%">
+            <stop offset="0%" stop-color="rgba(255,255,255,0.10)"/>
+            <stop offset="55%" stop-color="rgba(0,0,0,0.00)"/>
+            <stop offset="100%" stop-color="rgba(0,0,0,0.00)"/>
+          </radialGradient>
+          <radialGradient id="eyeBlue" cx="45%" cy="35%" r="75%">
+            <stop offset="0%" stop-color="rgba(175,235,255,0.96)"/>
+            <stop offset="60%" stop-color="rgba(95,195,255,0.92)"/>
+            <stop offset="100%" stop-color="rgba(35,130,210,0.92)"/>
+          </radialGradient>
+        </defs>
+
+        <rect x="0" y="0" width="1024" height="600" fill="url(#bgGlow)"/>
+
+        <!-- NOTE: face silhouette removed on purpose -->
+
+        <!-- Scale up face parts -->
+        <g transform="translate(512 300) translate(0 -10) scale(1.18) translate(-512 -300)">
+
+          <!-- Eye rings -->
+          <g>
+            <ellipse cx="360" cy="285" rx="120" ry="130" fill="url(#eyeBlue)" opacity="0.96"/>
+            <ellipse cx="664" cy="285" rx="120" ry="130" fill="url(#eyeBlue)" opacity="0.96"/>
+          </g>
+
+          <!-- Pupils (animated) -->
+          <g class="pupil">
+            <ellipse cx="360" cy="292" rx="78" ry="92" fill="rgba(0,0,0,0.88)"/>
+            <circle cx="332" cy="262" r="26" fill="rgba(255,255,255,0.92)"/>
+          </g>
+          <g class="pupil">
+            <ellipse cx="664" cy="292" rx="78" ry="92" fill="rgba(0,0,0,0.88)"/>
+            <circle cx="636" cy="262" r="26" fill="rgba(255,255,255,0.92)"/>
+          </g>
+
+          <!-- eyelids (smooth blink) -->
+          <g>
+            <ellipse class="lid" cx="360" cy="285" rx="122" ry="132" fill="rgba(10,14,20,0.96)"/>
+            <ellipse class="lid" cx="664" cy="285" rx="122" ry="132" fill="rgba(10,14,20,0.96)"/>
+          </g>
+
+          <!-- whiskers (moved down/outward) -->
+          <g stroke="rgba(210,240,255,0.35)" stroke-width="10" stroke-linecap="round" opacity="0.55">
+            <!-- left -->
+            <path d="M140 360 Q220 350 305 350"/>
+            <path d="M140 392 Q225 392 305 392"/>
+            <path d="M150 426 Q235 438 305 448"/>
+            <!-- right -->
+            <path d="M884 360 Q804 350 719 350"/>
+            <path d="M884 392 Q799 392 719 392"/>
+            <path d="M874 426 Q789 438 719 448"/>
+          </g>
+
+          <!-- mouth: small happy cat "w" -->
+          <g stroke="rgba(210,240,255,0.90)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.96">
+            <path d="M512 352 L500 366 L524 366 Z" fill="rgba(210,240,255,0.55)" stroke="none"/>
+            <path d="M472 386 Q492 404 512 386 Q532 404 552 386"/>
+          </g>
+
+        </g>
+      </svg>
+
+      
+    </div>
+  </div>
+  </div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
